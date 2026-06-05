@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "idrinth-outfit-system",
+  "version-string": "1.0.0",
+  "description": "A simple Outfit-Like System",
+  "homepage": "https://github.com/idrinth/IdrinthOutfitSystem",
+  "features": {
+    "plugin": {
+      "description": "SKSE plugin",
+      "dependencies": [
+        "commonlibsse-ng",
+        "spdlog",
+        "boost-algorithm",
+        "ryml"
+      ]
+    }
+  },
+  "default-features": [
+    "plugin"
+  ]
+}
