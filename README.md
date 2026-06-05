@@ -79,7 +79,7 @@ civilianLocations:
 npcs:
   - modName: IdrinthThalui.esp   # the plugin/ESP the NPC comes from
     formId: 0x803                # the NPC's FormID (hex)
-    # Optional: armor EditorIDs the plugin should NOT auto-add to this NPC.
+    # DEPRECATED: prefer `provide: false` on the relevant piece (see below).
     ignoredEditorIDs:
       - SomeArmorEditorID
     outfits:
@@ -99,7 +99,7 @@ npcs:
 | `npcs` | top level | The list of NPCs to manage. |
 | `modName` | npc / outfit | The ESP/ESM/ESL the form comes from, e.g. `IdrinthThalui.esp`. |
 | `formId` | npc / outfit | The form's ID in hexadecimal, e.g. `0x803`. |
-| `ignoredEditorIDs` | npc | Optional list of armor EditorIDs that should never be auto-added to this NPC (useful if you hand out some gear yourself). |
+| `ignoredEditorIDs` | npc | **Deprecated** — being replaced by the `provide` flag and may be removed in a future version. Optional list of armor EditorIDs that should never be auto-added to this NPC. Prefer setting `provide: false` on the relevant outfit piece instead. |
 | `outfits` | npc | One or more `military` / `civilian` armor pairs. |
 | `military` / `civilian` | outfit | An armor reference (`modName` + `formId`) for each context. |
 | `provide` | military / civilian | Optional, defaults to `true`. Set to `false` to stop the plugin from adding that piece to the NPC's inventory (it will still be equipped if the NPC already owns it). |
@@ -114,8 +114,8 @@ npcs:
 - When an NPC is **in combat**, or **not** in a civilian location, it equips
   the **military** set; otherwise it equips the **civilian** set.
 - The first time it sees a managed NPC, it clears their default/sleep outfit
-  and adds the configured armor pieces (respecting `provide` and
-  `ignoredEditorIDs`).
+  and adds the configured armor pieces (respecting `provide`, and the
+  deprecated `ignoredEditorIDs`).
 - If an undress effect is active (OSA / Bath factions or the
   `dz_undress_common.esp` effect), the plugin unequips its managed pieces and
   lets the other mod do its thing.
