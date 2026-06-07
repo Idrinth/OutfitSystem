@@ -7,6 +7,7 @@
 #include <utility>
 #include <map>
 #include <set>
+#include <unordered_set>
 
 std::map<std::string, spdlog::level::level_enum> logLevelMap = {
     {"trace", spdlog::level::level_enum::trace},
@@ -49,52 +50,208 @@ std::string yamlNodeToString(const c4::yml::ConstNodeRef& node) {
     auto buf = node.val();
     return std::string{buf.data(), buf.size()};
 }
+std::string str2lower(std::string s)
+{
+    std::ranges::transform(
+        s,
+        s.begin(),
+        [](const unsigned char c){ return std::tolower(c); }
+    );
+    return s;
+}
 
 class Config {
-public:
-    [[nodiscard]] spdlog::level::level_enum getLogLevel() const {
-        return logLevel;
-    }
-    static const Config& getSingleton() noexcept {
-        static Config instance;
-
-        static std::atomic_bool initialized;
-        if (!initialized.exchange(true)) {
-            std::ifstream inputFile(R"(Data\SKSE\Plugins\IdrinthOutfitSystem.yaml)", std::ios::in);
-            if (!inputFile.good()) {
-                return instance;
-            }
-            std::string data;
-            for (std::string line; std::getline(inputFile, line); ) {
-                data.append(line);
-                data.append("\n");
-            }
-            inputFile.close();
-
-            c4::substr sus = c4::to_substr(data);
-            c4::yml::Tree tree = ryml::parse_in_place(sus);
-            const c4::yml::NodeRef node = tree["logLevel"];
-            if (node.invalid() || node.val_is_null()) {
-                return instance;
-            }
-            if (const std::string out = yamlNodeToString(node); logLevelMap.contains(out)) {
-                instance.logLevel = logLevelMap[out];
-            }
+    public:
+        [[nodiscard]] spdlog::level::level_enum getLogLevel() const {
+            return logLevel;
         }
+        [[nodiscard]] bool getLoadEager() const {
+            return loadEager;
+        }
+        static Config getSingleton() noexcept {
+            static Config instance;
 
-        return instance;
-    }
-private:
-    spdlog::level::level_enum logLevel = spdlog::level::level_enum::err;
+            static std::atomic_bool initialized;
+            if (!initialized.exchange(true)) {
+                std::ifstream inputFile(R"(Data\SKSE\Plugins\IdrinthOutfitSystem.yaml)", std::ios::in);
+                if (!inputFile.good()) {
+                    return instance;
+                }
+                std::string data;
+                for (std::string line; std::getline(inputFile, line); ) {
+                    data.append(line);
+                    data.append("\n");
+                }
+                inputFile.close();
+
+                c4::substr sus = c4::to_substr(data);
+                c4::yml::Tree tree = ryml::parse_in_place(sus);
+                if (const c4::yml::NodeRef node = tree["logLevel"]; !node.invalid() && !node.val_is_null()) {
+                    if (const std::string out = yamlNodeToString(node); logLevelMap.contains(out)) {
+                        instance.logLevel = logLevelMap[out];
+                    }
+                }
+                if (const c4::yml::NodeRef node = tree["loadEager"]; !node.invalid() && !node.val_is_null()) {
+                    instance.loadEager = yamlNodeToString(node) == "true";
+                }
+            }
+
+            return instance;
+        }
+    private:
+        spdlog::level::level_enum logLevel = spdlog::level::level_enum::err;
+        bool loadEager = false;
+};
+class LocationKeywordCache {
+    public:
+        LocationKeywordCache() = default;
+        LocationKeywordCache(const LocationKeywordCache&) = delete;
+        LocationKeywordCache(LocationKeywordCache&&) = delete;
+        LocationKeywordCache& operator=(const LocationKeywordCache&) = delete;
+        LocationKeywordCache& operator=(const LocationKeywordCache&&) = delete;
+        bool hasKeyword(const std::string& keyword, RE::BGSLocation* location) {
+            std::scoped_lock lock(locationMapMutex);
+            return hasKeywordWrapper(keyword, location);
+        }
+        static LocationKeywordCache* getSingleton()
+        {
+            static LocationKeywordCache instance;
+            return &instance;
+        }
+        void clear() {
+            if (Config::getSingleton().getLoadEager()) {
+                logger::info("Skipping clear, load eager is configured.");
+                return;
+            }
+            std::scoped_lock lock(locationMapMutex);
+            locationMap.clear();
+            logger::info("Cleared cached locations.");
+        }
+        void primeCache(const std::list<std::string>& keywords) {
+            if (!Config::getSingleton().getLoadEager()) {
+                logger::info("Skipping priming, load eager is not configured.");
+                return;
+            }
+            logger::info("Starting priming the location cache.");
+            std::scoped_lock lock(locationMapMutex);
+            auto* handler = RE::TESDataHandler::GetSingleton();
+            if (!handler) {
+                return;
+            }
+            for (auto* loc : handler->GetFormArray<RE::BGSLocation>()) {
+                for (const auto& kw : keywords) {
+                    if (hasKeywordWrapper(kw, loc)) {
+                        logger::debug("Location {} has keyword {}", loc->GetName(), kw);
+                    } else {
+                        logger::debug("Location {} does not have keyword {}", loc->GetName(), kw);
+                    }
+                }
+            }
+            logger::info("Finished priming the location cache.");
+        }
+    private:
+        bool hasKeywordWrapper(const std::string& keyword, RE::BGSLocation* location) {
+            if (!location) {
+                logger::trace("Found no keyword {} for empty location", keyword);
+                return false;
+            }
+            auto& locationInMap = locationMap[location];
+            if (const auto keywordInMap = locationInMap.find(keyword); keywordInMap != locationInMap.end()) {
+                logger::trace("Found keyword {} for location {} from cache", keyword, location->GetName());
+                return keywordInMap->second;
+            }
+            const auto result = hasKeywordInternal(keyword, location);
+            locationInMap[keyword] = result;
+            if (result) {
+                logger::trace("Found keyword {} for location {} by iterating", keyword, location->GetName());
+                return true;
+            }
+            logger::trace("Didn't find keyword {} for location {} by iterating", keyword, location->GetName());
+            return result;
+        }
+        bool hasKeywordInternal(const std::string& keyword, const RE::BGSLocation* location) {
+            if (location->HasKeywordString(keyword)) {
+                logger::trace("Found keyword {} by manually searching for it with HasKeyword", keyword);
+                return true;
+            }
+            for (const auto& kw : location->GetKeywords()) {
+                if (kw->GetFormEditorID() && str2lower(kw->GetFormEditorID()) == str2lower(keyword)) {
+                    logger::trace("Found keyword {} by manually searching for it case insensitive", keyword);
+                    return true;
+                }
+            }
+            return hasKeywordWrapper(keyword, location->parentLoc);
+        }
+        mutable std::mutex locationMapMutex;
+        std::unordered_map<RE::BGSLocation*, std::unordered_map<std::string, bool>> locationMap;
+};
+class InitializedNPCsCache {
+    public:
+        InitializedNPCsCache() = default;
+        InitializedNPCsCache(const InitializedNPCsCache&) = delete;
+        InitializedNPCsCache(InitializedNPCsCache&&) = delete;
+        InitializedNPCsCache& operator=(const InitializedNPCsCache&) = delete;
+        InitializedNPCsCache& operator=(const InitializedNPCsCache&&) = delete;
+        bool mayInitialize(RE::FormID formID) {
+            std::scoped_lock lock(setMutex);
+            if (formIDs.contains(formID)) {
+                return false;
+            }
+            formIDs.emplace(formID);
+            return true;
+        }
+        static InitializedNPCsCache* getSingleton()
+        {
+            static InitializedNPCsCache instance;
+            return &instance;
+        }
+        void clear() {
+            std::scoped_lock lock(setMutex);
+            formIDs.clear();
+        }
+        std::unordered_set<RE::FormID> getAll() {
+            return formIDs;
+        }
+    private:
+        std::unordered_set<RE::FormID> formIDs;
+        std::mutex setMutex;
 };
 class TrackedArmorPair {
     public:
-        TrackedArmorPair(RE::TESObjectARMO* a_military, RE::TESObjectARMO* a_civilian, bool a_provideCivilian = true, bool a_provideMilitary = true)
+        TrackedArmorPair(RE::TESObjectARMO* a_military, RE::TESObjectARMO* a_civilian, bool a_provideMilitary = true, bool a_provideCivilian = true)
             : military(a_military), civilian(a_civilian), provideMilitary(a_provideMilitary), provideCivilian(a_provideCivilian) {}
         RE::TESObjectARMO* military;
         RE::TESObjectARMO* civilian;
         bool provideMilitary;
         bool provideCivilian;
+};
+class UniqueFormIDQueue {
+    public:
+        UniqueFormIDQueue() = default;
+        RE::FormID pop() {
+            std::scoped_lock lock(queueMutex);
+            const auto out = queue.front();
+            queue.pop();
+            formIDs.erase(out);
+            return out;
+        }
+        void push(RE::FormID formID) {
+            std::scoped_lock lock(queueMutex);
+            if (formIDs.find(formID) != formIDs.end()) {
+                logger::trace("FormID {} already exists", formID);
+                return;
+            }
+            queue.emplace(formID);
+            formIDs.try_emplace(formID, formID);
+        }
+        bool empty() {
+            std::scoped_lock lock(queueMutex);
+            return queue.empty();
+        }
+    private:
+        std::unordered_map<RE::FormID, RE::FormID> formIDs;
+        std::queue<RE::FormID> queue;
+        std::mutex queueMutex;
 };
 class TrackedNPC {
     public:
@@ -137,42 +294,48 @@ class TrackedNPC {
                 }
             }
         }
-        void handleEquip(RE::Actor* npc) const {
+        bool handleEquip(RE::Actor* npc) const {
             if (processing.exchange(true)) {
-                return;
+                return true;
             }
             struct Guard { std::atomic_bool& f; ~Guard(){ f = false; } } guard{processing};
 
             if (!npc) {
-                return;
+                return true;
             }
             logger::debug("Equipping NPC {}", npc->GetName());
 
-            if (npc->IsDead() || npc->IsDisabled() || !npc->Is3DLoaded()) {
-                logger::debug("NPC {} is inactive(dead, disabled or not loaded)", npc->GetName());
-                return;
+            if (npc->IsDead() || npc->IsDisabled()) {
+                logger::debug("NPC {} is disabled or dead", npc->GetName());
+                return true;
+            }
+            if (!npc->Is3DLoaded()) {
+                logger::debug("NPC {} is not loaded)", npc->GetName());
+                return false;
             }
             if (!npc->HasContainer()) {
                 logger::debug("NPC {} has no inventory", npc->GetName());
-                return;
+                return true;
             }
 
             auto* invChanges = npc->GetInventoryChanges();
             if (!invChanges || !invChanges->entryList) {
                 logger::debug("NPC {} inventory not ready yet", npc->GetName());
-                return;
+                return false;
             }
 
             const auto counts = npc->GetInventoryCounts();
             std::set<RE::TESBoundObject*> worn;
-            for (auto* entry : *invChanges->entryList) {
+            for (const auto* entry : *invChanges->entryList) {
                 if (!entry || !entry->object || !entry->extraLists) {
                     continue;
                 }
-                for (auto* xList : *entry->extraLists) {
-                    if (xList && xList->HasType(RE::ExtraDataType::kWorn)) {
+                for (const auto* xList : *entry->extraLists) {
+                    if (!xList) {
+                        continue;
+                    }
+                    if (xList->HasType(RE::ExtraDataType::kWorn) || xList->HasType(RE::ExtraDataType::kWornLeft)) {
                         worn.insert(entry->object);
-                        break;
                     }
                 }
             }
@@ -188,7 +351,7 @@ class TrackedNPC {
             };
             logger::trace("Inventory snapshot built: {} distinct objects, {} worn", counts.size(), worn.size());
 
-            if (npc->GetActorBase() && (npc->GetActorBase()->defaultOutfit || npc->GetActorBase()->sleepOutfit)) {
+            if (InitializedNPCsCache::getSingleton()->mayInitialize(npc->GetFormID())) {
                 logger::debug("NPC {} is uninitialized, handling now", npc->GetName());
                 npc->SetDefaultOutfit(nullptr, false);
                 npc->SetSleepOutfit(nullptr, false);
@@ -198,29 +361,30 @@ class TrackedNPC {
                     if (!military || !civilian) {
                         continue;
                     }
-                    if (armorPair.provideMilitary && !isInList(military->GetFormEditorID(), ignoredArmorEditorIDs) && !hasItem(military)) {
+                    if (armorPair.provideMilitary && military->GetFormEditorID() && !isInList(military->GetFormEditorID(), ignoredArmorEditorIDs) && !hasItem(military)) {
                         npc->AddObjectToContainer(military, nullptr, 1, nullptr);
                     }
-                    if (armorPair.provideCivilian && military != civilian && !isInList(civilian->GetFormEditorID(), ignoredArmorEditorIDs) && !hasItem(civilian)) {
+                    if (armorPair.provideCivilian && military != civilian && civilian->GetFormEditorID() && !isInList(civilian->GetFormEditorID(), ignoredArmorEditorIDs) && !hasItem(civilian)) {
                         npc->AddObjectToContainer(civilian, nullptr, 1, nullptr);
                     }
                 }
                 logger::debug("NPC {} initialised, deferring equip to next tick", npc->GetName());
-                return;
+                return false;
             }
             if (magicEffectBathUndress && !npc->IsInCombat() && npc->AsMagicTarget() && npc->AsMagicTarget()->HasMagicEffect(magicEffectBathUndress->baseEffect)) {
                 handleUnequip(npc, worn);
                 logger::debug("Unequipping NPC {} due to magic effect done", npc->GetName());
-                return;
+                return true;
             }
             for (const auto& faction : factionsOSA) {
                 if (npc->IsInFaction(faction)) {
                     handleUnequip(npc, worn);
                     logger::debug("Unequipping NPC {} due to factions done", npc->GetName());
-                    return;
+                    return true;
                 }
             }
             const bool isCivilian = !npc->IsInCombat() && isInCivilianLocation(npc->GetCurrentLocation());
+            logger::debug("NPC is in civilian location? {}", isCivilian);
             for (const auto& armorPair : gear) {
                 const auto preferred = isCivilian ? armorPair.civilian : armorPair.military;
                 const auto fallback = isCivilian ? armorPair.military : armorPair.civilian;
@@ -252,18 +416,26 @@ class TrackedNPC {
                 }
             }
             logger::debug("Equipped NPC {}", npc->GetName());
+            return true;
         }
     private:
-        bool isInCivilianLocation(const RE::BGSLocation* location) const {
+        bool isInCivilianLocation(RE::BGSLocation* location) const {
             if (!location) {
+                logger::trace("Location is nullptr");
+                return false;
+            }
+            if (location->GetDangerous()) {
+                logger::trace("Location is dangerous");
                 return false;
             }
             for (const auto& keyword : civilianKeywords) {
-                if (location->HasKeywordString(keyword)) {
+                if (LocationKeywordCache::getSingleton()->hasKeyword(keyword, location)) {
+                    logger::trace("Location has keyword {}", keyword);
                     return true;
                 }
             }
-            return isInCivilianLocation(location->parentLoc);
+            logger::trace("Location is not civilian");
+            return false;
         }
         std::list<TrackedArmorPair> gear;
         std::list<std::string> civilianKeywords;
@@ -272,8 +444,31 @@ class TrackedNPC {
         std::list<std::string> ignoredArmorEditorIDs;
         mutable std::atomic_bool processing{false};
 };
-
-class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>, public RE::BSTEventSink<RE::TESCombatEvent>, public RE::BSTEventSink<RE::TESEquipEvent>, public RE::BSTEventSink<RE::TESCellAttachDetachEvent>, public RE::BSTEventSink<RE::TESActorLocationChangeEvent>, public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
+class NPCRetryEntry {
+    public:
+        NPCRetryEntry(const RE::FormID formId) {
+            fId = formId;
+        }
+        [[nodiscard]] RE::FormID getFormId() const {
+            return fId;
+        }
+        void incrementRetry() {
+            std::scoped_lock lock(processing);
+            retryCount++;
+        }
+        void resetRetry() {
+            std::scoped_lock lock(processing);
+            retryCount = 0;
+        }
+        [[nodiscard]] bool mayRetry() const {
+            return retryCount < 5;
+        }
+    private:
+        RE::FormID fId;
+        int retryCount = 0;
+        mutable std::mutex processing;
+};
+class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>, public RE::BSTEventSink<RE::TESActiveEffectApplyRemoveEvent>, public RE::BSTEventSink<RE::TESCombatEvent>, public RE::BSTEventSink<RE::TESEquipEvent>, public RE::BSTEventSink<RE::TESCellAttachDetachEvent>, public RE::BSTEventSink<RE::TESActorLocationChangeEvent>, public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
     public:
         EquipmentEventSink() = default;
         EquipmentEventSink(const EquipmentEventSink&) = delete;
@@ -286,7 +481,191 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
             static EquipmentEventSink instance;
             return &instance;
         }
-        void handleNPC(const c4::yml::ConstNodeRef child, const std::list<std::string>& civilianKeywords, RE::Effect* magicEffect, const std::list<RE::TESFaction*>& factions) {
+        void setup()
+        {
+            logger::info("Loading configs from file system");
+            auto currentBasePath = std::filesystem::current_path().string();
+            std::list<std::string> configuredKeywords;
+            int errors = 0;
+            int amount = 0;
+            {
+                std::scoped_lock lock(npcsMutex);
+                npcs.clear();
+            }
+            magicEffect = nullptr;
+            try {
+                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x800"), "dz_undress_common.esp")) {
+                    if (const auto effect = form->As<RE::Effect>()) {
+                        magicEffect = effect;
+                    }
+                }
+            } catch (std::exception& e) {
+                logger::debug("Failed to retrieve undress effect for NPCs from dz_undress_common.esp - not an issue usually. {}", e.what());
+            }
+            std::list<RE::TESFaction*> factions;
+            try {
+                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x182E"), "OSA.esm")) {
+                    if (const auto faction = form->As<RE::TESFaction>()) {
+                        factions.emplace_back(faction);
+                    }
+                }
+                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x182F"), "OSA.esm")) {
+                    if (const auto faction = form->As<RE::TESFaction>()) {
+                        factions.emplace_back(faction);
+                    }
+                }
+                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x1830"), "OSA.esm")) {
+                    if (const auto faction = form->As<RE::TESFaction>()) {
+                        factions.emplace_back(faction);
+                    }
+                }
+            } catch (std::exception& e) {
+                logger::debug("Failed to retrieve undress factions from OSA.esm - not an issue usually. {}", e.what());
+            }
+            if (std::filesystem::exists("Data/skse/plugins/IdrinthOutfitSystem")) {
+                logger::debug("Folder found, iterating");
+                std::scoped_lock lock(npcsMutex);
+                for (auto& file: std::filesystem::recursive_directory_iterator{"Data/skse/plugins/IdrinthOutfitSystem"}) {
+                    if (file.is_regular_file()) {
+                        amount++;
+                        auto p = file.path().string();
+                        logger::trace("Loading {}", p);
+                        try {
+                            for (const auto& keyword : handleFile(p, factions)) {
+                                configuredKeywords.emplace_back(keyword);
+                            }
+                        } catch (std::exception& e) {
+                            logger::error("Failed to parse config {}: {}", p, e.what());
+                            errors++;
+                        }
+                    }
+                }
+            }
+            logger::info("Loaded {} configs from file system with {} errors", amount, errors);
+            if (Config::getSingleton().getLoadEager()) {
+                LocationKeywordCache::getSingleton()->primeCache(configuredKeywords);
+            }
+        }
+        RE::BSEventNotifyControl handle(const RE::Actor* npc) const {
+            internalHandler(npc);
+            return RE::BSEventNotifyControl::kContinue;
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESCombatEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCombatEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESEquipEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCellAttachDetachEvent>* a_eventSource) override {
+            if (!a_event || !a_event->reference) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->reference->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESActorLocationChangeEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActorLocationChangeEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESMagicEffectApplyEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESMagicEffectApplyEvent>* a_eventSource) override {
+            if (!a_event || !a_event->target || !magicEffect || !magicEffect->baseEffect) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (a_event->magicEffect != magicEffect->baseEffect->formID) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->target->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESObjectLoadedEvent>* a_eventSource) override {
+            if (!a_event || !a_event->formID) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            const auto form = RE::TESForm::LookupByID(a_event->formID);
+            if (!form) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(form->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESActiveEffectApplyRemoveEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>* a_eventSource) override {
+            if (!a_event || !a_event->target) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (a_event->isApplied == true) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->target->As<RE::Actor>());
+        }
+        void queuedHandler() {
+            logger::trace("Queued Handler firing");
+            RE::FormID fId;
+            {
+                std::scoped_lock lock(todosMutex);
+                if (todos.empty()) {
+                    bool hadContent = false;
+                    while (!nextTodos.empty()) {
+                        todos.push(nextTodos.pop());
+                        hadContent = true;
+                    }
+                    if (hadContent) {
+                        auto self = this;
+                        SKSE::GetTaskInterface()->AddTask([self]() {
+                            self->queuedHandler();
+                        });
+                        return;
+                    }
+                    scheduleRetry(std::chrono::milliseconds(150));
+                    return;
+                }
+                fId = todos.pop();
+            }
+            queuedHandle(fId);
+            auto self = this;
+            SKSE::GetTaskInterface()->AddTask([self]() {
+                self->queuedHandler();
+            });
+        }
+        static void scheduleHandler() {
+            static std::atomic_bool started{false};
+            if (started.exchange(true)) {
+                return;
+            }
+            constexpr auto delay = std::chrono::milliseconds(150);
+            scheduleRetry(delay);
+        }
+    private:
+        static void scheduleRetry(std::chrono::milliseconds delay) {
+            std::thread([delay]() {
+                std::this_thread::sleep_for(delay);
+                SKSE::GetTaskInterface()->AddTask([]() {
+                    EquipmentEventSink::getSingleton()->queuedHandler();
+                });
+            }).detach();
+        }
+        void internalHandler(const RE::Actor* npc) const {
+            if (!npc) {
+                return;
+            }
+            const auto fId = npc->GetFormID();
+            {
+                std::scoped_lock lock(npcsMutex);
+                if (!npcs.contains(fId)) {
+                    return;
+                }
+            }
+            std::scoped_lock lock(todosMutex);
+            if (const auto found = npcRetries.find(fId); found != npcRetries.end()) {
+                found->second.resetRetry();
+                nextTodos.push(fId);
+            }
+        }
+        void handleNPC(const c4::yml::ConstNodeRef child, const std::list<std::string>& civilianKeywords, const std::list<RE::TESFaction*>& factions) {
             std::string modName = yamlNodeToString(child["modName"]);
             std::string formId = yamlNodeToString(child["formId"]);
             const std::uint32_t fid = parseHex(formId);
@@ -352,16 +731,17 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                         logger::error("Civilian form {} from {} is not armor", formIdCivilian, modNameCivilian);
                         continue;
                     }
-                    outfits.emplace_back(armorMilitary, armorCivilian, provideCivilian!="false", provideMilitary!="false");
+                    outfits.emplace_back(armorMilitary, armorCivilian, provideMilitary!="false", provideCivilian!="false");
                 }
             }
             if (npc->GetActorBase() && npc->GetActorBase()->IsUnique()) {
                 npcs.try_emplace(npc->GetFormID(), npc, ignoredEditorIDs, civilianKeywords, outfits, magicEffect, factions);
+                npcRetries.try_emplace(npc->GetFormID(), npc->GetFormID());
             }
         }
-        void handleFile(const std::string& p, RE::Effect* magicEffect, const std::list<RE::TESFaction*>& factions) {
+        std::list<std::string> handleFile(const std::string& p, const std::list<RE::TESFaction*>& factions) {
             if (!p.ends_with(".yml") && !p.ends_with(".yaml")) {
-                return;
+                return {};
             }
             std::ifstream inputFile(p, std::ios::in);
             if (!inputFile.good()) {
@@ -385,95 +765,40 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
             if (!node2.invalid() && node2.has_children()) {
                 for (auto child : node2.children()) {
                     if (!child.invalid() && !child.val_is_null()) {
-                        civilianKeywords.emplace_back(yamlNodeToString(child));
+                        auto keyword = yamlNodeToString(child);
+                        civilianKeywords.emplace_back(keyword);
                     }
                 }
             }
             if (node.has_children()) {
                 logger::trace("Going into npc list");
                 for (auto child : node.children()) {
-                    handleNPC(child, civilianKeywords, magicEffect, factions);
+                    handleNPC(child, civilianKeywords, factions);
                 }
             }
+            return civilianKeywords;
         }
-        void setup()
-        {
-            logger::info("Loading configs from file system");
-            auto currentBasePath = std::filesystem::current_path().string();
-            int errors = 0;
-            int amount = 0;
+        void queuedHandle(const RE::FormID fId) {
+            if (!fId) {
+                return;
+            }
+            const auto npcRetryEntryOut = npcRetries.find(fId);
+            if (npcRetryEntryOut == npcRetries.end()) {
+                return;
+            }
+            const auto npcRetryEntry = &npcRetryEntryOut->second;
+            if (!npcRetryEntry || !npcRetryEntry->mayRetry() || !npcRetryEntry->getFormId()) {
+                return;
+            }
+            npcRetryEntry->incrementRetry();
+            bool needsRetry = false;
             {
                 std::scoped_lock lock(npcsMutex);
-                npcs.clear();
-            }
-            RE::Effect* magicEffect = nullptr;
-            try {
-                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x800"), "dz_undress_common.esp")) {
-                    if (const auto effect = form->As<RE::Effect>()) {
-                        magicEffect = effect;
-                    }
-                }
-            } catch (std::exception& e) {
-                logger::debug("Failed to retrieve undress effect for NPCs from dz_undress_common.esp - not an issue usually. {}", e.what());
-            }
-            std::list<RE::TESFaction*> factions;
-            try {
-                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x182E"), "OSA.esm")) {
-                    if (const auto faction = form->As<RE::TESFaction>()) {
-                        factions.emplace_back(faction);
-                    }
-                }
-                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x182F"), "OSA.esm")) {
-                    if (const auto faction = form->As<RE::TESFaction>()) {
-                        factions.emplace_back(faction);
-                    }
-                }
-                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x1830"), "OSA.esm")) {
-                    if (const auto faction = form->As<RE::TESFaction>()) {
-                        factions.emplace_back(faction);
-                    }
-                }
-            } catch (std::exception& e) {
-                logger::debug("Failed to retrieve undress factions from OSA.esm - not an issue usually. {}", e.what());
-            }
-            if (std::filesystem::exists("Data/skse/plugins/IdrinthOutfitSystem")) {
-                logger::debug("Folder found, iterating");
-                std::scoped_lock lock(npcsMutex);
-                for (auto& file: std::filesystem::recursive_directory_iterator{"Data/skse/plugins/IdrinthOutfitSystem"}) {
-                    if (file.is_regular_file()) {
-                        amount++;
-                        auto p = file.path().string();
-                        logger::trace("Loading {}", p);
-                        try {
-                            handleFile(p, magicEffect, factions);
-                        } catch (std::exception& e) {
-                            logger::error("Failed to parse config {}: {}", p, e.what());
-                            errors++;
-                        }
-                    }
-                }
-            }
-            logger::info("Loaded {} configs from file system with {} errors", amount, errors);
-        }
-        RE::BSEventNotifyControl handle(RE::Actor* npc) const {
-            if (!npc) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            const auto fId = npc->GetFormID();
-            {
-                std::scoped_lock lock(npcsMutex);
-                if (!npcs.contains(fId)) {
-                    return RE::BSEventNotifyControl::kContinue;
-                }
-            }
-            auto* self = this;
-            SKSE::GetTaskInterface()->AddTask([self, fId]() {
-                std::scoped_lock lock(self->npcsMutex);
-                const auto it = self->npcs.find(fId);
-                if (it == self->npcs.end()) {
+                const auto it = npcs.find(npcRetryEntry->getFormId());
+                if (it == npcs.end()) {
                     return;
                 }
-                const auto form = RE::TESForm::LookupByID(fId);
+                const auto form = RE::TESForm::LookupByID(npcRetryEntry->getFormId());
                 if (!form) {
                     return;
                 }
@@ -481,54 +806,20 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                 if (!actor) {
                     return;
                 }
-                it->second.handleEquip(actor);
-            });
-            return RE::BSEventNotifyControl::kContinue;
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESCombatEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCombatEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
+                needsRetry = !it->second.handleEquip(actor);
             }
-            return handle(a_event->actor->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESEquipEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
+            if (needsRetry) {
+                std::scoped_lock lock2(todosMutex);
+                nextTodos.push(fId);
             }
-            return handle(a_event->actor->As<RE::Actor>());
         }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCellAttachDetachEvent>* a_eventSource) override {
-            if (!a_event || !a_event->reference) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->reference->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESActorLocationChangeEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActorLocationChangeEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->actor->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESMagicEffectApplyEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESMagicEffectApplyEvent>* a_eventSource) override {
-            if (!a_event || !a_event->target) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->target->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESObjectLoadedEvent>* a_eventSource) override {
-            if (!a_event || !a_event->formID) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            const auto form = RE::TESForm::LookupByID(a_event->formID);
-            if (!form) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(form->As<RE::Actor>());
-        }
-
-    private:
         std::map<RE::FormID, TrackedNPC> npcs;
+        mutable std::map<RE::FormID, NPCRetryEntry> npcRetries;
         mutable std::recursive_mutex npcsMutex;
+        mutable std::recursive_mutex todosMutex;
+        RE::Effect* magicEffect = nullptr;
+        mutable UniqueFormIDQueue todos;
+        mutable UniqueFormIDQueue nextTodos;
 };
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
@@ -538,15 +829,70 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
             EquipmentEventSink::getSingleton()->setup();
             logger::info("Setting up Event Handler finished.");
             return;
+        case SKSE::MessagingInterface::kNewGame:
+            logger::info("Setting up queue handler.");
+            EquipmentEventSink::scheduleHandler();
+            logger::info("Queue handler setup.");
+        case SKSE::MessagingInterface::kPreLoadGame:
+            logger::info("Clearing location cache.");
+            LocationKeywordCache::getSingleton()->clear();
+            logger::info("Cleared location cache.");
+            return;
+        case SKSE::MessagingInterface::kPostLoadGame:
+            logger::info("Setting up queue handler.");
+            EquipmentEventSink::scheduleHandler();
+            logger::info("Queue handler setup.");
+            return;
         default:
             return;
     }
 }
-
+inline const auto InitializedNPCRecord = _byteswap_ulong('IOSI');
+void LoadCallback(SKSE::SerializationInterface* serializer)
+{
+    logger::debug("Clearing initialized NPCs after game load.");
+    InitializedNPCsCache::getSingleton()->clear();
+    std::uint32_t type;
+    std::uint32_t size;
+    std::uint32_t version;
+    while (serializer->GetNextRecordInfo(type, version, size)) {
+        if (type == InitializedNPCRecord) {
+            std::size_t npcsSize;
+            serializer->ReadRecordData(&npcsSize, sizeof(npcsSize));
+            for (; npcsSize > 0; --npcsSize) {
+                RE::FormID formId;
+                serializer->ReadRecordData(&formId, sizeof(formId));
+                const auto actor = RE::Actor::LookupByID(formId);
+                if (!actor || !actor->As<RE::Actor>() || !InitializedNPCsCache::getSingleton()->mayInitialize(formId)) {
+                    logger::debug("Failed to set npc {} as initialized.", formId);
+                }
+            }
+        }
+    }
+}
+void SaveCallback(SKSE::SerializationInterface* serializer) {
+    logger::debug("Saving initialized NPCs.");
+    if (!serializer->OpenRecord(InitializedNPCRecord, 1)) {
+        logger::debug("Failed to open npc list.");
+        return;
+    }
+    auto formIDs = InitializedNPCsCache::getSingleton()->getAll();
+    std::size_t size = formIDs.size();
+    if (!serializer->WriteRecordData(&size, sizeof(size))) {
+        logger::debug("Failed to write NPC list header.");
+        return;
+    }
+    for (auto formID : formIDs) {
+        if (!serializer->WriteRecordData(&formID, sizeof(formID))) {
+            logger::debug("Failed to write NPC list entry, continuing anyway.");
+        }
+    }
+    logger::debug("Saved initialized NPCs.");
+}
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
 
-    const auto config = Config::getSingleton();
+    const auto &config = Config::getSingleton();
     SetupLogger(config.getLogLevel());
 
     logger::info("Setup with LogLevel {}", logLevelList[config.getLogLevel()]);
@@ -560,9 +906,15 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     eventSourceHolder->AddEventSink<RE::TESActorLocationChangeEvent>(eventSink);
     eventSourceHolder->AddEventSink<RE::TESMagicEffectApplyEvent>(eventSink);
     eventSourceHolder->AddEventSink<RE::TESObjectLoadedEvent>(eventSink);
+    eventSourceHolder->AddEventSink<RE::TESActiveEffectApplyRemoveEvent>(eventSink);
 
     auto* messagingInterface = SKSE::GetMessagingInterface();
     messagingInterface->RegisterListener(OnMessage);
+
+    const auto serializer = SKSE::GetSerializationInterface();
+    serializer->SetUniqueID(_byteswap_ulong('IOS_'));
+    serializer->SetLoadCallback(LoadCallback);
+    serializer->SetSaveCallback(SaveCallback);
 
     return true;
 }

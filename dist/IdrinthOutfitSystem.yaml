@@ -1,1 +1,6 @@
+# Possible values(right means less messages): trace, debug, info, warn, error, critical, off
 logLevel: info
+# Set to true to process locations once on game process start. Might bring some performance over checking on the fly,
+# but costs startup time before reaching the main menu. Do NOT load differently modded games in one session if this
+# is true
+loadEager: false
