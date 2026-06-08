@@ -424,7 +424,7 @@ class TrackedNPC {
                 logger::trace("Location is nullptr");
                 return false;
             }
-            if (location->GetDangerous()) {
+            if (LocationKeywordCache::getSingleton()->hasKeyword("LocTypeClearable", location) && !location->IsCleared()) {
                 logger::trace("Location is dangerous");
                 return false;
             }
@@ -468,39 +468,18 @@ class NPCRetryEntry {
         int retryCount = 0;
         mutable std::mutex processing;
 };
-class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>, public RE::BSTEventSink<RE::TESActiveEffectApplyRemoveEvent>, public RE::BSTEventSink<RE::TESCombatEvent>, public RE::BSTEventSink<RE::TESEquipEvent>, public RE::BSTEventSink<RE::TESCellAttachDetachEvent>, public RE::BSTEventSink<RE::TESActorLocationChangeEvent>, public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
+class EquipmentEventHandler {
     public:
-        EquipmentEventSink() = default;
-        EquipmentEventSink(const EquipmentEventSink&) = delete;
-        EquipmentEventSink(EquipmentEventSink&&) = delete;
-        EquipmentEventSink& operator=(const EquipmentEventSink&) = delete;
-        EquipmentEventSink& operator=(const EquipmentEventSink&&) = delete;
-
-        static EquipmentEventSink* getSingleton()
-        {
-            static EquipmentEventSink instance;
-            return &instance;
-        }
-        void setup()
-        {
+        void setup(RE::Effect* magicEffect) {
             logger::info("Loading configs from file system");
             auto currentBasePath = std::filesystem::current_path().string();
             std::list<std::string> configuredKeywords;
+            configuredKeywords.emplace_back("LocTypeClearable");
             int errors = 0;
             int amount = 0;
             {
                 std::scoped_lock lock(npcsMutex);
                 npcs.clear();
-            }
-            magicEffect = nullptr;
-            try {
-                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x800"), "dz_undress_common.esp")) {
-                    if (const auto effect = form->As<RE::Effect>()) {
-                        magicEffect = effect;
-                    }
-                }
-            } catch (std::exception& e) {
-                logger::debug("Failed to retrieve undress effect for NPCs from dz_undress_common.esp - not an issue usually. {}", e.what());
             }
             std::list<RE::TESFaction*> factions;
             try {
@@ -531,7 +510,7 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                         auto p = file.path().string();
                         logger::trace("Loading {}", p);
                         try {
-                            for (const auto& keyword : handleFile(p, factions)) {
+                            for (const auto& keyword : handleFile(p, factions, magicEffect)) {
                                 configuredKeywords.emplace_back(keyword);
                             }
                         } catch (std::exception& e) {
@@ -546,105 +525,58 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                 LocationKeywordCache::getSingleton()->primeCache(configuredKeywords);
             }
         }
-        RE::BSEventNotifyControl handle(const RE::Actor* npc) const {
+        void queue(const RE::Actor* npc) const {
             internalHandler(npc);
-            return RE::BSEventNotifyControl::kContinue;
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESCombatEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCombatEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->actor->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESEquipEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->actor->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCellAttachDetachEvent>* a_eventSource) override {
-            if (!a_event || !a_event->reference) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->reference->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESActorLocationChangeEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActorLocationChangeEvent>* a_eventSource) override {
-            if (!a_event || !a_event->actor) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->actor->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESMagicEffectApplyEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESMagicEffectApplyEvent>* a_eventSource) override {
-            if (!a_event || !a_event->target || !magicEffect || !magicEffect->baseEffect) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            if (a_event->magicEffect != magicEffect->baseEffect->formID) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->target->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESObjectLoadedEvent>* a_eventSource) override {
-            if (!a_event || !a_event->formID) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            const auto form = RE::TESForm::LookupByID(a_event->formID);
-            if (!form) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(form->As<RE::Actor>());
-        }
-        RE::BSEventNotifyControl ProcessEvent(const RE::TESActiveEffectApplyRemoveEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>* a_eventSource) override {
-            if (!a_event || !a_event->target) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            if (a_event->isApplied == true) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-            return handle(a_event->target->As<RE::Actor>());
         }
         void queuedHandler() {
             logger::trace("Queued Handler firing");
+            if (handleQueue()) {
+                auto self = this;
+                SKSE::GetTaskInterface()->AddTask([self]() {
+                    self->queuedHandler();
+                });
+            } else {
+                scheduleRetry(150);
+            }
+        }
+        void start() {
+            static std::atomic_bool started{false};
+            if (started.exchange(true)) {
+                return;
+            }
+            scheduleRetry(150);
+        }
+    private:
+        bool handleQueue() {
             RE::FormID fId;
             {
                 std::scoped_lock lock(todosMutex);
                 if (todos.empty()) {
                     bool hadContent = false;
+                    std::scoped_lock lock2(nextTodosMutex);
                     while (!nextTodos.empty()) {
                         todos.push(nextTodos.pop());
                         hadContent = true;
                     }
                     if (hadContent) {
-                        auto self = this;
-                        SKSE::GetTaskInterface()->AddTask([self]() {
-                            self->queuedHandler();
-                        });
-                        return;
+                        return true;
                     }
-                    scheduleRetry(std::chrono::milliseconds(150));
-                    return;
+                    return false;
                 }
                 fId = todos.pop();
             }
             queuedHandle(fId);
+            return true;
+        }
+        void scheduleRetry(int delay) {
+            scheduleRetry(std::chrono::milliseconds(delay));
+        }
+        void scheduleRetry(std::chrono::milliseconds delay) {
             auto self = this;
-            SKSE::GetTaskInterface()->AddTask([self]() {
-                self->queuedHandler();
-            });
-        }
-        static void scheduleHandler() {
-            static std::atomic_bool started{false};
-            if (started.exchange(true)) {
-                return;
-            }
-            constexpr auto delay = std::chrono::milliseconds(150);
-            scheduleRetry(delay);
-        }
-    private:
-        static void scheduleRetry(std::chrono::milliseconds delay) {
-            std::thread([delay]() {
+            std::thread([delay, self]() {
                 std::this_thread::sleep_for(delay);
-                SKSE::GetTaskInterface()->AddTask([]() {
-                    EquipmentEventSink::getSingleton()->queuedHandler();
+                SKSE::GetTaskInterface()->AddTask([self]() {
+                    self->queuedHandler();
                 });
             }).detach();
         }
@@ -659,13 +591,14 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                     return;
                 }
             }
-            std::scoped_lock lock(todosMutex);
+            std::scoped_lock lock(nextTodosMutex);
+            std::scoped_lock lock2(npcsMutex);
             if (const auto found = npcRetries.find(fId); found != npcRetries.end()) {
                 found->second.resetRetry();
                 nextTodos.push(fId);
             }
         }
-        void handleNPC(const c4::yml::ConstNodeRef child, const std::list<std::string>& civilianKeywords, const std::list<RE::TESFaction*>& factions) {
+        void handleNPC(const c4::yml::ConstNodeRef child, const std::list<std::string>& civilianKeywords, const std::list<RE::TESFaction*>& factions, RE::Effect* magicEffect) {
             std::string modName = yamlNodeToString(child["modName"]);
             std::string formId = yamlNodeToString(child["formId"]);
             const std::uint32_t fid = parseHex(formId);
@@ -739,7 +672,7 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                 npcRetries.try_emplace(npc->GetFormID(), npc->GetFormID());
             }
         }
-        std::list<std::string> handleFile(const std::string& p, const std::list<RE::TESFaction*>& factions) {
+        std::list<std::string> handleFile(const std::string& p, const std::list<RE::TESFaction*>& factions, RE::Effect* magicEffect) {
             if (!p.ends_with(".yml") && !p.ends_with(".yaml")) {
                 return {};
             }
@@ -773,7 +706,7 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
             if (node.has_children()) {
                 logger::trace("Going into npc list");
                 for (auto child : node.children()) {
-                    handleNPC(child, civilianKeywords, factions);
+                    handleNPC(child, civilianKeywords, factions, magicEffect);
                 }
             }
             return civilianKeywords;
@@ -809,7 +742,7 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
                 needsRetry = !it->second.handleEquip(actor);
             }
             if (needsRetry) {
-                std::scoped_lock lock2(todosMutex);
+                std::scoped_lock lock2(nextTodosMutex);
                 nextTodos.push(fId);
             }
         }
@@ -817,9 +750,113 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>,
         mutable std::map<RE::FormID, NPCRetryEntry> npcRetries;
         mutable std::recursive_mutex npcsMutex;
         mutable std::recursive_mutex todosMutex;
-        RE::Effect* magicEffect = nullptr;
+        mutable std::recursive_mutex nextTodosMutex;
         mutable UniqueFormIDQueue todos;
         mutable UniqueFormIDQueue nextTodos;
+};
+class EquipmentEventSink: public RE::BSTEventSink<RE::TESContainerChangedEvent>, public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>, public RE::BSTEventSink<RE::TESActiveEffectApplyRemoveEvent>, public RE::BSTEventSink<RE::TESCombatEvent>, public RE::BSTEventSink<RE::TESEquipEvent>, public RE::BSTEventSink<RE::TESCellAttachDetachEvent>, public RE::BSTEventSink<RE::TESActorLocationChangeEvent>, public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
+    public:
+        EquipmentEventSink() = default;
+        EquipmentEventSink(const EquipmentEventSink&) = delete;
+        EquipmentEventSink(EquipmentEventSink&&) = delete;
+        EquipmentEventSink& operator=(const EquipmentEventSink&) = delete;
+        EquipmentEventSink& operator=(const EquipmentEventSink&&) = delete;
+
+        static EquipmentEventSink* getSingleton()
+        {
+            static EquipmentEventSink instance;
+            return &instance;
+        }
+        void setup()
+        {
+            magicEffect = nullptr;
+            try {
+                if (RE::TESForm* form = RE::TESDataHandler::GetSingleton()->LookupForm(parseHex("0x800"), "dz_undress_common.esp")) {
+                    if (const auto effect = form->As<RE::Effect>()) {
+                        magicEffect = effect;
+                    }
+                }
+            } catch (std::exception& e) {
+                logger::debug("Failed to retrieve undress effect for NPCs from dz_undress_common.esp - not an issue usually. {}", e.what());
+            }
+            handler.setup(magicEffect);
+        }
+        RE::BSEventNotifyControl handle(const RE::Actor* npc) const {
+            handler.queue(npc);
+            return RE::BSEventNotifyControl::kContinue;
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESCombatEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCombatEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESEquipEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESCellAttachDetachEvent>* a_eventSource) override {
+            if (!a_event || !a_event->reference) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->reference->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESActorLocationChangeEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActorLocationChangeEvent>* a_eventSource) override {
+            if (!a_event || !a_event->actor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->actor->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESMagicEffectApplyEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESMagicEffectApplyEvent>* a_eventSource) override {
+            if (!a_event || !a_event->target || !magicEffect || !magicEffect->baseEffect) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (a_event->magicEffect != magicEffect->baseEffect->formID) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->target->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESObjectLoadedEvent>* a_eventSource) override {
+            if (!a_event || !a_event->formID) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            const auto form = RE::TESForm::LookupByID(a_event->formID);
+            if (!form) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(form->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESActiveEffectApplyRemoveEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>* a_eventSource) override {
+            if (!a_event || !a_event->target) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (a_event->isApplied == true) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            return handle(a_event->target->As<RE::Actor>());
+        }
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESContainerChangedEvent* a_event, [[maybe_unused]]RE::BSTEventSource<RE::TESContainerChangedEvent>* a_eventSource) override {
+            if (!a_event) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            const auto target = RE::TESForm::LookupByID(a_event->newContainer);
+            const auto source = RE::TESForm::LookupByID(a_event->oldContainer);
+            if (target) {
+                handle(target->As<RE::Actor>());
+            }
+            if (source) {
+                handle(source->As<RE::Actor>());
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+        void scheduleHandler() {
+            handler.start();
+        }
+    private:
+        RE::Effect* magicEffect = nullptr;
+        EquipmentEventHandler handler;
 };
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
@@ -831,7 +868,7 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
             return;
         case SKSE::MessagingInterface::kNewGame:
             logger::info("Setting up queue handler.");
-            EquipmentEventSink::scheduleHandler();
+            EquipmentEventSink::getSingleton()->scheduleHandler();
             logger::info("Queue handler setup.");
         case SKSE::MessagingInterface::kPreLoadGame:
             logger::info("Clearing location cache.");
@@ -840,7 +877,7 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
             return;
         case SKSE::MessagingInterface::kPostLoadGame:
             logger::info("Setting up queue handler.");
-            EquipmentEventSink::scheduleHandler();
+            EquipmentEventSink::getSingleton()->scheduleHandler();
             logger::info("Queue handler setup.");
             return;
         default:
@@ -862,9 +899,11 @@ void LoadCallback(SKSE::SerializationInterface* serializer)
             for (; npcsSize > 0; --npcsSize) {
                 RE::FormID formId;
                 serializer->ReadRecordData(&formId, sizeof(formId));
-                const auto actor = RE::Actor::LookupByID(formId);
-                if (!actor || !actor->As<RE::Actor>() || !InitializedNPCsCache::getSingleton()->mayInitialize(formId)) {
-                    logger::debug("Failed to set npc {} as initialized.", formId);
+                RE::FormID currentFormId;
+                serializer->ResolveFormID(formId, currentFormId);
+                const auto actor = RE::Actor::LookupByID(currentFormId);
+                if (!actor || !actor->As<RE::Actor>() || !InitializedNPCsCache::getSingleton()->mayInitialize(currentFormId)) {
+                    logger::debug("Failed to set npc {} as initialized.", currentFormId);
                 }
             }
         }
