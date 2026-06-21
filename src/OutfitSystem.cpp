@@ -546,6 +546,31 @@ class EquipmentEventHandler {
             }
             scheduleRetry(150);
         }
+        void enable(RE::Actor* actor, const bool enable) const {
+            if (!actor || !actor->GetFormID()) {
+                return;
+            }
+            const auto fId = actor->GetFormID();
+            std::scoped_lock lock(npcsMutex);
+            if (!npcs.contains(fId)) {
+                logger::debug("En-/Disabling Actor {} can't be done because it is unhandled.", actor->GetFormID());
+                return;
+            }
+            if (enable && !paused.contains(fId)) {
+                paused.insert(fId);
+                return;
+            }
+            if (!enable && paused.contains(fId)) {
+                paused.erase(fId);
+            }
+        }
+        bool enabled(RE::Actor* actor) const {
+            if (!actor || !actor->GetFormID()) {
+                return true;
+            }
+            std::scoped_lock lock(todosMutex);
+            return !paused.contains(actor->GetFormID());
+        }
     private:
         bool handleQueue() {
             RE::FormID fId;
@@ -558,12 +583,14 @@ class EquipmentEventHandler {
                         todos.push(nextTodos.pop());
                         hadContent = true;
                     }
-                    if (hadContent) {
-                        return true;
-                    }
-                    return false;
+                    return hadContent;
                 }
                 fId = todos.pop();
+                if (!paused.contains(fId)) {
+                    std::scoped_lock lock2(nextTodosMutex);
+                    nextTodos.push(fId);
+                    return false;
+                }
             }
             queuedHandle(fId);
             return true;
@@ -576,7 +603,7 @@ class EquipmentEventHandler {
             std::thread([delay, self]() {
                 std::this_thread::sleep_for(delay);
                 SKSE::GetTaskInterface()->AddTask([self]() {
-                    self->queuedHandler();
+                    self->handleQueue();
                 });
             }).detach();
         }
@@ -753,6 +780,7 @@ class EquipmentEventHandler {
         mutable std::recursive_mutex nextTodosMutex;
         mutable UniqueFormIDQueue todos;
         mutable UniqueFormIDQueue nextTodos;
+        mutable std::set<RE::FormID> paused;
 };
 class EquipmentEventSink: public RE::BSTEventSink<RE::TESContainerChangedEvent>, public RE::BSTEventSink<RE::TESMagicEffectApplyEvent>, public RE::BSTEventSink<RE::TESActiveEffectApplyRemoveEvent>, public RE::BSTEventSink<RE::TESCombatEvent>, public RE::BSTEventSink<RE::TESEquipEvent>, public RE::BSTEventSink<RE::TESCellAttachDetachEvent>, public RE::BSTEventSink<RE::TESActorLocationChangeEvent>, public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
     public:
@@ -766,6 +794,12 @@ class EquipmentEventSink: public RE::BSTEventSink<RE::TESContainerChangedEvent>,
         {
             static EquipmentEventSink instance;
             return &instance;
+        }
+        void enable(RE::Actor* actor, const bool enable) {
+            handler.enable(actor, enable);
+        }
+        bool enabled(RE::Actor* actor) {
+            return handler.enabled(actor);
         }
         void setup()
         {
@@ -927,6 +961,21 @@ void SaveCallback(SKSE::SerializationInterface* serializer) {
         }
     }
     logger::debug("Saved initialized NPCs.");
+}
+void disableSystem(RE::StaticFunctionTag*, RE::Actor* actor) {
+    EquipmentEventSink::getSingleton()->enable(actor, false);
+}
+void enableSystem(RE::StaticFunctionTag*, RE::Actor* actor) {
+    EquipmentEventSink::getSingleton()->enable(actor, true);
+}
+bool isSystemEnabled(RE::StaticFunctionTag*, RE::Actor* actor) {
+    EquipmentEventSink::getSingleton()->enabled(actor);
+}
+bool bindPapyrusFunctions(RE::BSScript::IVirtualMachine* vm) {
+    vm->RegisterFunction("disable", "IdrinthOutfitSystem", disableSystem);
+    vm->RegisterFunction("enable", "IdrinthOutfitSystem", enableSystem);
+    vm->RegisterFunction("isEnabled", "IdrinthOutfitSystem", isSystemEnabled);
+    return true;
 }
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);

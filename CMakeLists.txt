@@ -48,6 +48,14 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/dist/${PROJECT_NAME}.yaml" "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/")
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E tar cfv "${PROJECT_NAME}.zip" --format=zip "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/${PROJECT_NAME}.yaml" "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/${PROJECT_NAME}.dll")
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/dist/${PROJECT_NAME}.pex" "${CMAKE_CURRENT_BINARY_DIR}/Scripts/")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/dist/${PROJECT_NAME}.psc" "${CMAKE_CURRENT_BINARY_DIR}/Source/Scripts/")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/dist/${PROJECT_NAME}.psc" "${CMAKE_CURRENT_BINARY_DIR}/Scripts/Source/")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E tar cfv "${PROJECT_NAME}.zip" --format=zip "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/${PROJECT_NAME}.yaml" "${CMAKE_CURRENT_BINARY_DIR}/Scripts/${PROJECT_NAME}.pex" "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/${PROJECT_NAME}.dll")
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E tar cfv "${PROJECT_NAME}-pdb.zip" --format=zip "${CMAKE_CURRENT_BINARY_DIR}/SKSE/Plugins/${PROJECT_NAME}.pdb")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E tar cfv "${PROJECT_NAME}-dev.zip" --format=zip "${CMAKE_CURRENT_BINARY_DIR}/Source/Scripts/${PROJECT_NAME}.psc" "${CMAKE_CURRENT_BINARY_DIR}/Scripts/Source/${PROJECT_NAME}.psc")
