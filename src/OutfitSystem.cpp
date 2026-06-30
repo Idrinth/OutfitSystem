@@ -546,7 +546,7 @@ class EquipmentEventHandler {
             }
             scheduleRetry(150);
         }
-        void enable(RE::Actor* actor, const bool enable) const {
+        void enable(const RE::Actor* actor, const bool enable) const {
             if (!actor || !actor->GetFormID()) {
                 return;
             }
@@ -556,15 +556,15 @@ class EquipmentEventHandler {
                 logger::debug("En-/Disabling Actor {} can't be done because it is unhandled.", actor->GetFormID());
                 return;
             }
-            if (enable && !paused.contains(fId)) {
-                paused.insert(fId);
-                return;
-            }
-            if (!enable && paused.contains(fId)) {
+            if (enable && paused.contains(fId)) {
                 paused.erase(fId);
+                queue(actor);
+            }
+            if (!enable && !paused.contains(fId)) {
+                paused.insert(fId);
             }
         }
-        bool enabled(RE::Actor* actor) const {
+        bool enabled(const RE::Actor* actor) const {
             if (!actor || !actor->GetFormID()) {
                 return true;
             }
@@ -969,7 +969,7 @@ void enableSystem(RE::StaticFunctionTag*, RE::Actor* actor) {
     EquipmentEventSink::getSingleton()->enable(actor, true);
 }
 bool isSystemEnabled(RE::StaticFunctionTag*, RE::Actor* actor) {
-    EquipmentEventSink::getSingleton()->enabled(actor);
+    return EquipmentEventSink::getSingleton()->enabled(actor);
 }
 bool bindPapyrusFunctions(RE::BSScript::IVirtualMachine* vm) {
     vm->RegisterFunction("disable", "IdrinthOutfitSystem", disableSystem);
